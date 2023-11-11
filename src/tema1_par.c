@@ -51,71 +51,6 @@ void update_image(ppm_image *image, ppm_image *contour, int x, int y) {
     }
 }
 
-// Corresponds to step 1 of the marching squares algorithm, which focuses on sampling the image.
-// Builds a p x q grid of points with values which can be either 0 or 1, depending on how the
-// pixel values compare to the `sigma` reference value. The points are taken at equal distances
-// in the original image, based on the `step_x` and `step_y` arguments.
-unsigned char **sample_grid(ppm_image *image, int step_x, int step_y, unsigned char sigma) {
-    int p = image->x / step_x;
-    int q = image->y / step_y;
-
-    unsigned char **grid = (unsigned char **)malloc((p + 1) * sizeof(unsigned char*));
-    if (!grid) {
-        fprintf(stderr, "Unable to allocate memory\n");
-        exit(1);
-    }
-
-    for (int i = 0; i <= p; i++) {
-        grid[i] = (unsigned char *)malloc((q + 1) * sizeof(unsigned char));
-        if (!grid[i]) {
-            fprintf(stderr, "Unable to allocate memory\n");
-            exit(1);
-        }
-    }
-
-    for (int i = 0; i < p; i++) {
-        for (int j = 0; j < q; j++) {
-            ppm_pixel curr_pixel = image->data[i * step_x * image->y + j * step_y];
-
-            unsigned char curr_color = (curr_pixel.red + curr_pixel.green + curr_pixel.blue) / 3;
-
-            if (curr_color > sigma) {
-                grid[i][j] = 0;
-            } else {
-                grid[i][j] = 1;
-            }
-        }
-    }
-    grid[p][q] = 0;
-
-    // last sample points have no neighbors below / to the right, so we use pixels on the
-    // last row / column of the input image for them
-    for (int i = 0; i < p; i++) {
-        ppm_pixel curr_pixel = image->data[i * step_x * image->y + image->x - 1];
-
-        unsigned char curr_color = (curr_pixel.red + curr_pixel.green + curr_pixel.blue) / 3;
-
-        if (curr_color > sigma) {
-            grid[i][q] = 0;
-        } else {
-            grid[i][q] = 1;
-        }
-    }
-    for (int j = 0; j < q; j++) {
-        ppm_pixel curr_pixel = image->data[(image->x - 1) * image->y + j * step_y];
-
-        unsigned char curr_color = (curr_pixel.red + curr_pixel.green + curr_pixel.blue) / 3;
-
-        if (curr_color > sigma) {
-            grid[p][j] = 0;
-        } else {
-            grid[p][j] = 1;
-        }
-    }
-
-    return grid;
-}
-
 // Corresponds to step 2 of the marching squares algorithm, which focuses on identifying the
 // type of contour which corresponds to each subgrid. It determines the binary value of each
 // sample fragment of the original image and replaces the pixels in the original image with
@@ -152,68 +87,200 @@ void free_resources(ppm_image *image, ppm_image **contour_map, unsigned char **g
 struct thread_argv {
     int num_threads;
     int thread_id;
-    ppm_image *new_image;
+    ppm_image *scaled_image;
     ppm_image *image;
+    ppm_image **contour_map;
+    unsigned char **grid;
+    int step_x;
+    int step_y;
+    pthread_barrier_t *br;
+    int rescale;
+    int sigma;
 };
 
 void *thread_func(void *arg) {
     struct thread_argv *argv = (struct thread_argv *)arg;
 
-    int start = argv->thread_id * (double)argv->new_image->x / argv->num_threads;
-    int end = MIN((argv->thread_id + 1) * (double)argv->new_image->x / argv->num_threads, argv->new_image->x);
-    uint8_t sample[3];
+    // ------------------------------------------- RESCALE ---------------------------------------------------
+    // -------------------------------------------------------------------------------------------------------
+    // -------------------------------------------------------------------------------------------------------
 
-    for (int i = start; i < end; ++i) {
-        for (int j = 0; j < argv->new_image->y; ++j) {
-            float u = (float)i / (float)(argv->new_image->x - 1);
-            float v = (float)j / (float)(argv->new_image->y - 1);
-            sample_bicubic(argv->image, u, v, sample);
+    // we only rescale downwards
+    if (argv->rescale) {
+        uint8_t sample[3];
 
-            argv->new_image->data[i * argv->new_image->y + j].red = sample[0];
-            argv->new_image->data[i * argv->new_image->y + j].green = sample[1];
-            argv->new_image->data[i * argv->new_image->y + j].blue = sample[2];
+        int start = argv->thread_id * (double)argv->scaled_image->x / argv->num_threads;
+        int end = MIN((argv->thread_id + 1) * (double)argv->scaled_image->x / argv->num_threads, argv->scaled_image->x);
+
+        // use bicubic interpolation for scaling
+        for (int i = start; i < end; i++) {
+            for (int j = 0; j < argv->scaled_image->y; j++) {
+                float u = (float)i / (float)(argv->scaled_image->x - 1);
+                float v = (float)j / (float)(argv->scaled_image->y - 1);
+                sample_bicubic(argv->image, u, v, sample);
+
+                argv->scaled_image->data[i * argv->scaled_image->y + j].red = sample[0];
+                argv->scaled_image->data[i * argv->scaled_image->y + j].green = sample[1];
+                argv->scaled_image->data[i * argv->scaled_image->y + j].blue = sample[2];
+            }
         }
     }
+
+    pthread_barrier_wait(argv->br);
+    
+
+    // -------------------------------------------- SAMPLE ---------------------------------------------------
+    // -------------------------------------------------------------------------------------------------------
+    // -------------------------------------------------------------------------------------------------------
+
+    // // 2. Sample the grid
+    // unsigned char **grid = sample_grid(*(argv->scaled_image), argv->step_x, argv->step_y, SIGMA);
+
+    int p = argv->scaled_image->x / argv->step_x;
+    int q = argv->scaled_image->y / argv->step_y;
+
+    int start = argv->thread_id * (double)p / argv->num_threads;
+    int end = MIN((argv->thread_id + 1) * (double)p / argv->num_threads, p);
+
+    for (int i = start; i < end; i++) {
+        for (int j = 0; j < q; j++) {
+            ppm_pixel curr_pixel = argv->scaled_image->data[i * argv->step_x * argv->scaled_image->y + j * argv->step_y];
+
+            unsigned char curr_color = (curr_pixel.red + curr_pixel.green + curr_pixel.blue) / 3;
+
+            if (curr_color > argv->sigma) {
+                argv->grid[i][j] = 0;
+            } else {
+                argv->grid[i][j] = 1;
+            }
+        }
+    }
+
+    argv->grid[p][q] = 0;
+
+    pthread_barrier_wait(argv->br);
+
+    // last sample points have no neighbors below / to the right, so we use pixels on the
+    // last row / column of the input image for them
+    for (int i = start; i < end; i++) {
+        ppm_pixel curr_pixel = argv->scaled_image->data[i * argv->step_x * argv->scaled_image->y + argv->scaled_image->x - 1];
+
+        unsigned char curr_color = (curr_pixel.red + curr_pixel.green + curr_pixel.blue) / 3;
+
+        if (curr_color > argv->sigma) {
+            argv->grid[i][q] = 0;
+        } else {
+            argv->grid[i][q] = 1;
+        }
+    }
+
+    pthread_barrier_wait(argv->br);
+
+    start = argv->thread_id * (double)q / argv->num_threads;
+    end = MIN((argv->thread_id + 1) * (double)q / argv->num_threads, q);
+    for (int j = start; j < end; j++) {
+        ppm_pixel curr_pixel = argv->scaled_image->data[(argv->scaled_image->x - 1) * argv->scaled_image->y + j * argv->step_y];
+
+        unsigned char curr_color = (curr_pixel.red + curr_pixel.green + curr_pixel.blue) / 3;
+
+        if (curr_color > argv->sigma) {
+            argv->grid[p][j] = 0;
+        } else {
+            argv->grid[p][j] = 1;
+        }
+    }
+
+    pthread_barrier_wait(argv->br);
+
+    // // 3. March the squares
+    // march(*(argv->scaled_image), grid, argv->contour_map, argv->step_x, argv->step_y);
 
     pthread_exit(NULL);
 }
 
-ppm_image *rescale_image(ppm_image *image, int num_threads) {
-    // we only rescale downwards
+int main(int argc, char *argv[]) {
+    if (argc < 4) {
+        fprintf(stderr, "Usage: ./tema1 <in_file> <out_file> <P>\n");
+        return 1;
+    }
+
+    ppm_image *image = read_ppm(argv[1]);
+    int step_x = STEP;
+    int step_y = STEP;
+
+    // 0. Initialize contour map, scaled image and grid
+    // ---------------------------------------------- INIT ---------------------------------------------------
+    // -------------------------------------------------------------------------------------------------------
+    // -------------------------------------------------------------------------------------------------------
+    ppm_image **contour_map = init_contour_map();
+    ppm_image *scaled_image;
+    int rescale = 0;
     if (image->x <= RESCALE_X && image->y <= RESCALE_Y) {
-        return image;
+        scaled_image = image;
+    } else {
+        scaled_image = (ppm_image *)malloc(sizeof(ppm_image));
+        if (!scaled_image) {
+            fprintf(stderr, "Unable to allocate memory\n");
+            exit(1);
+        }
+
+        scaled_image->data = (ppm_pixel*)malloc(RESCALE_X * RESCALE_Y * sizeof(ppm_pixel));
+        if (!scaled_image->data) {
+            fprintf(stderr, "Unable to allocate memory\n");
+            exit(1);
+        }
+
+        scaled_image->x = RESCALE_X;
+        scaled_image->y = RESCALE_Y;
+        rescale = 1;
     }
 
-    // alloc memory for image
-    ppm_image *new_image = (ppm_image *)malloc(sizeof(ppm_image));
-    if (!new_image) {
+    int p = scaled_image->x / step_x;
+    int q = scaled_image->y / step_y;
+
+    unsigned char **grid = (unsigned char **)malloc((p + 1) * sizeof(unsigned char*));
+    if (!grid) {
         fprintf(stderr, "Unable to allocate memory\n");
         exit(1);
     }
-    new_image->x = RESCALE_X;
-    new_image->y = RESCALE_Y;
 
-    new_image->data = (ppm_pixel*)malloc(new_image->x * new_image->y * sizeof(ppm_pixel));
-    if (!new_image) {
-        fprintf(stderr, "Unable to allocate memory\n");
-        exit(1);
+    for (int i = 0; i <= p; i++) {
+        grid[i] = (unsigned char *)malloc((q + 1) * sizeof(unsigned char));
+        if (!grid[i]) {
+            fprintf(stderr, "Unable to allocate memory\n");
+            exit(1);
+        }
     }
 
-    // use bicubic interpolation for scaling
+    // ---------------------------------------------- INIT ---------------------------------------------------
+    // -------------------------------------------------------------------------------------------------------
+    // -------------------------------------------------------------------------------------------------------
+
+    int num_threads = atoi(argv[3]);
     pthread_t threads[num_threads];
     int rc;
     void *status;
-    struct thread_argv argv[num_threads];
+    struct thread_argv arg[num_threads];
+    pthread_barrier_t barrier;
+    pthread_barrier_init(&barrier, NULL, num_threads);
 
     for (int i = 0; i < num_threads; ++i) {
-        argv[i].num_threads = num_threads;
-        argv[i].thread_id = i;
-        argv[i].new_image = new_image;
-        argv[i].image = image;
+        arg[i].num_threads = num_threads;
+        arg[i].thread_id = i;
+
+        arg[i].image = image;
+        arg[i].contour_map = contour_map;
+        arg[i].scaled_image = scaled_image;
+        arg[i].step_x = step_x;
+        arg[i].step_y = step_y;
+        arg[i].br = &barrier;
+        arg[i].rescale = rescale;
+        arg[i].sigma = SIGMA;
+        arg[i].grid = grid;
     }
 
     for (int i = 0; i < num_threads; ++i) {
-        rc = pthread_create(&threads[i], NULL, thread_func, &argv[i]);
+        rc = pthread_create(&threads[i], NULL, thread_func, &arg[i]);
 
         if (rc) {
             printf("Couldn't create thread %d\n", i);
@@ -229,31 +296,7 @@ ppm_image *rescale_image(ppm_image *image, int num_threads) {
             exit(-1);
         }
     }
-
-    free(image->data);
-    free(image);
-
-    return new_image;
-}
-
-int main(int argc, char *argv[]) {
-    if (argc < 4) {
-        fprintf(stderr, "Usage: ./tema1 <in_file> <out_file> <P>\n");
-        return 1;
-    }
-
-    ppm_image *image = read_ppm(argv[1]);
-    int step_x = STEP;
-    int step_y = STEP;
-
-    // 0. Initialize contour map
-    ppm_image **contour_map = init_contour_map();
-
-    // 1. Rescale the image
-    ppm_image *scaled_image = rescale_image(image, atoi(argv[3]));
-
-    // 2. Sample the grid
-    unsigned char **grid = sample_grid(scaled_image, step_x, step_y, SIGMA);
+    pthread_barrier_destroy(&barrier);
 
     // 3. March the squares
     march(scaled_image, grid, contour_map, step_x, step_y);
