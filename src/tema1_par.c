@@ -51,22 +51,6 @@ void update_image(ppm_image *image, ppm_image *contour, int x, int y) {
     }
 }
 
-// Corresponds to step 2 of the marching squares algorithm, which focuses on identifying the
-// type of contour which corresponds to each subgrid. It determines the binary value of each
-// sample fragment of the original image and replaces the pixels in the original image with
-// the pixels of the corresponding contour image accordingly.
-void march(ppm_image *image, unsigned char **grid, ppm_image **contour_map, int step_x, int step_y) {
-    int p = image->x / step_x;
-    int q = image->y / step_y;
-
-    for (int i = 0; i < p; i++) {
-        for (int j = 0; j < q; j++) {
-            unsigned char k = 8 * grid[i][j] + 4 * grid[i][j + 1] + 2 * grid[i + 1][j + 1] + 1 * grid[i + 1][j];
-            update_image(image, contour_map[k], i * step_x, j * step_y);
-        }
-    }
-}
-
 // Calls `free` method on the utilized resources.
 void free_resources(ppm_image *image, ppm_image **contour_map, unsigned char **grid, int step_x) {
     for (int i = 0; i < CONTOUR_CONFIG_COUNT; i++) {
@@ -133,9 +117,6 @@ void *thread_func(void *arg) {
     // -------------------------------------------------------------------------------------------------------
     // -------------------------------------------------------------------------------------------------------
 
-    // // 2. Sample the grid
-    // unsigned char **grid = sample_grid(*(argv->scaled_image), argv->step_x, argv->step_y, SIGMA);
-
     int p = argv->scaled_image->x / argv->step_x;
     int q = argv->scaled_image->y / argv->step_y;
 
@@ -192,8 +173,18 @@ void *thread_func(void *arg) {
 
     pthread_barrier_wait(argv->br);
 
-    // // 3. March the squares
-    // march(*(argv->scaled_image), grid, argv->contour_map, argv->step_x, argv->step_y);
+    // -------------------------------------------- MARCH ----------------------------------------------------
+    // -------------------------------------------------------------------------------------------------------
+    // -------------------------------------------------------------------------------------------------------
+
+    start = argv->thread_id * (double)p / argv->num_threads;
+    end = MIN((argv->thread_id + 1) * (double)p / argv->num_threads, p);
+    for (int i = start; i < end; i++) {
+        for (int j = 0; j < q; j++) {
+            unsigned char k = 8 * argv->grid[i][j] + 4 * argv->grid[i][j + 1] + 2 * argv->grid[i + 1][j + 1] + 1 * argv->grid[i + 1][j];
+            update_image(argv->scaled_image, argv->contour_map[k], i * argv->step_x, j * argv->step_y);
+        }
+    }
 
     pthread_exit(NULL);
 }
@@ -297,9 +288,6 @@ int main(int argc, char *argv[]) {
         }
     }
     pthread_barrier_destroy(&barrier);
-
-    // 3. March the squares
-    march(scaled_image, grid, contour_map, step_x, step_y);
 
     // 4. Write output
     write_ppm(scaled_image, argv[2]);
