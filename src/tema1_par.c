@@ -258,7 +258,6 @@ int main(int argc, char *argv[]) {
     for (int i = 0; i < num_threads; ++i) {
         arg[i].num_threads = num_threads;
         arg[i].thread_id = i;
-
         arg[i].image = image;
         arg[i].contour_map = contour_map;
         arg[i].scaled_image = scaled_image;
@@ -293,6 +292,10 @@ int main(int argc, char *argv[]) {
     write_ppm(scaled_image, argv[2]);
 
     free_resources(scaled_image, contour_map, grid, step_x);
+    if (rescale) {
+        free(image->data);
+        free(image);
+    }
 
     return 0;
 }
